@@ -1,16 +1,19 @@
 import path from "node:path";
 import * as vscode from "vscode";
+import { createComparisonReplacement } from "./comparisonTransition";
+import { buildDiffModel } from "./diffModel";
 import {
   findRepositoryRoot,
+  getBaseFileContent,
   getChangedFiles,
   getCurrentBranch,
-  getFileDiff,
   getLocalBranches,
   getMergeBase,
   GitError,
   localBranchExists,
   resolveRepositoryPath
 } from "./git";
+import { InsetManager, PROPOSED_API_INSTRUCTIONS } from "./insetManager";
 import { selectPreferredBase } from "./preferredBase";
 import type {
   ActiveComparison,
@@ -38,21 +41,23 @@ const STATUS_DESCRIPTIONS: Record<string, string> = {
   "??": "Untracked"
 };
 
+const EDIT_DEBOUNCE_MS = 200;
+
 export class ComparisonController implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly addedDecoration: vscode.TextEditorDecorationType;
   private readonly modifiedDecoration: vscode.TextEditorDecorationType;
-  private readonly deletedDecoration: vscode.TextEditorDecorationType;
   private readonly statusBar: vscode.StatusBarItem;
+  private readonly insets = new InsetManager();
+  private readonly editTimers = new Map<string, NodeJS.Timeout>();
   private comparison: ActiveComparison | undefined;
   private generation = 0;
+  private proposedApiErrorGeneration = -1;
 
   public constructor(private readonly context: vscode.ExtensionContext) {
     this.addedDecoration = vscode.window.createTextEditorDecorationType({
       isWholeLine: true,
-      backgroundColor: new vscode.ThemeColor(
-        "branchDiff.addedLineBackground"
-      ),
+      backgroundColor: new vscode.ThemeColor("branchDiff.addedLineBackground"),
       overviewRulerColor: new vscode.ThemeColor(
         "branchDiff.addedLineBackground"
       ),
@@ -68,41 +73,29 @@ export class ComparisonController implements vscode.Disposable {
       ),
       overviewRulerLane: vscode.OverviewRulerLane.Left
     });
-    this.deletedDecoration = vscode.window.createTextEditorDecorationType({
-      isWholeLine: true,
-      borderStyle: "solid",
-      borderWidth: "0 0 0 3px",
-      borderColor: new vscode.ThemeColor(
-        "branchDiff.deletedLineForeground"
-      ),
-      overviewRulerColor: new vscode.ThemeColor(
-        "branchDiff.deletedLineForeground"
-      ),
-      overviewRulerLane: vscode.OverviewRulerLane.Left,
-      after: {
-        contentText: "  -",
-        color: new vscode.ThemeColor("branchDiff.deletedLineForeground")
-      }
-    });
     this.statusBar = vscode.window.createStatusBarItem(
       vscode.StatusBarAlignment.Left,
       100
     );
     this.statusBar.command = "branchDiff.browseChangedFiles";
-    this.statusBar.tooltip = "Browse files changed relative to the base branch";
 
     this.disposables.push(
       this.addedDecoration,
       this.modifiedDecoration,
-      this.deletedDecoration,
       this.statusBar,
+      this.insets,
       vscode.window.onDidChangeVisibleTextEditors((editors) => {
+        this.insets.retainEditors(editors);
         for (const editor of editors) {
-          void this.applyDecorations(editor);
+          this.renderEditorInBackground(editor);
         }
       }),
-      vscode.workspace.onDidSaveTextDocument((document) => {
-        void this.refreshSavedFile(document);
+      vscode.workspace.onDidChangeTextDocument((event) => {
+        this.scheduleDocumentRender(event.document);
+      }),
+      vscode.workspace.onDidCloseTextDocument((document) => {
+        this.cancelDocumentTimer(document);
+        this.insets.clearDocument(document);
       })
     );
   }
@@ -115,17 +108,14 @@ export class ComparisonController implements vscode.Disposable {
   }
 
   public async startComparison(): Promise<void> {
-    const generation = this.invalidateAsyncOperations(this.comparison);
+    const generation = this.beginReplacement();
+    let installedComparison: ActiveComparison | undefined;
     try {
       const repoRoot = await this.chooseRepository();
       if (repoRoot === undefined || !this.isGenerationCurrent(generation)) {
         return;
       }
-
       const currentBranch = await getCurrentBranch(repoRoot);
-      if (!this.isGenerationCurrent(generation)) {
-        return;
-      }
       const branches = (await getLocalBranches(repoRoot)).filter(
         (branch) => branch !== currentBranch
       );
@@ -140,24 +130,20 @@ export class ComparisonController implements vscode.Disposable {
       }
 
       const stateKey = this.lastBaseStateKey(repoRoot);
-      const recentBase = this.context.workspaceState.get<string>(stateKey);
-      const preferred = selectPreferredBase(branches, recentBase);
+      const preferred = selectPreferredBase(
+        branches,
+        this.context.workspaceState.get<string>(stateKey)
+      );
       const baseBranch = await this.chooseBaseBranch(branches, preferred);
-      if (
-        baseBranch === undefined ||
-        !this.isGenerationCurrent(generation)
-      ) {
+      if (baseBranch === undefined || !this.isGenerationCurrent(generation)) {
         return;
       }
-
       const mergeBase = await getMergeBase(repoRoot, baseBranch);
-      if (!this.isGenerationCurrent(generation)) {
-        return;
-      }
       const changedFiles = await getChangedFiles(repoRoot, mergeBase);
       if (!this.isGenerationCurrent(generation)) {
         return;
       }
+
       const comparison: ActiveComparison = {
         generation,
         repoRoot,
@@ -165,23 +151,28 @@ export class ComparisonController implements vscode.Disposable {
         baseBranch,
         mergeBase,
         changedFiles,
-        parsedRanges: new Map(),
-        highlightsVisible: true
+        baseContents: new Map(),
+        highlightsVisible: true,
+        expandedDeletionsVisible: true
       };
       this.comparison = comparison;
-      this.clearDecorations();
+      installedComparison = comparison;
       await this.context.workspaceState.update(stateKey, baseBranch);
       if (!this.isComparisonCurrent(comparison, generation)) {
         return;
       }
-      this.updateStatusBar();
-      await this.applyToVisibleEditors(comparison, generation);
-      if (!this.isComparisonCurrent(comparison, generation)) {
-        return;
+      await this.renderVisibleEditors(comparison, generation);
+      if (this.isComparisonCurrent(comparison, generation)) {
+        this.updateStatusBar();
+        await this.browseChangedFiles();
       }
-      await this.browseChangedFiles();
     } catch (error) {
-      if (this.isGenerationCurrent(generation)) {
+      if (
+        this.isGenerationCurrent(generation) ||
+        (installedComparison !== undefined &&
+          this.comparison === installedComparison)
+      ) {
+        this.clearComparison();
         this.showError("Unable to start comparison", error);
       }
     }
@@ -201,33 +192,60 @@ export class ComparisonController implements vscode.Disposable {
       );
       return;
     }
-    const generation = comparison.generation;
-
     const selected = await this.chooseChangedFile(comparison.changedFiles);
     if (
-      selected === undefined ||
-      !this.isFileCurrent(comparison, generation, selected)
+      selected !== undefined &&
+      this.isFileCurrent(comparison, comparison.generation, selected)
     ) {
-      return;
+      await this.openChangedFile(selected);
     }
-    await this.openChangedFile(selected);
   }
 
   public async toggleHighlights(): Promise<void> {
-    if (this.comparison === undefined) {
-      void vscode.window.showInformationMessage(
-        "Branch Diff: Start a comparison first."
-      );
+    const comparison = this.requireComparison();
+    if (comparison === undefined) {
       return;
     }
-
-    const comparison = this.comparison;
-    const generation = this.invalidateAsyncOperations(comparison);
+    const generation = this.invalidate(comparison);
     comparison.highlightsVisible = !comparison.highlightsVisible;
     if (!comparison.highlightsVisible) {
       this.clearDecorations();
     } else {
-      await this.applyToVisibleEditors(comparison, generation);
+      try {
+        await this.renderVisibleEditors(comparison, generation);
+      } catch (error) {
+        if (this.isComparisonCurrent(comparison, generation)) {
+          this.clearComparison();
+          this.showError("Unable to enable comparison highlights", error);
+        }
+        return;
+      }
+    }
+    if (this.isComparisonCurrent(comparison, generation)) {
+      this.updateStatusBar();
+    }
+  }
+
+  public async toggleExpandedDeletions(): Promise<void> {
+    const comparison = this.requireComparison();
+    if (comparison === undefined) {
+      return;
+    }
+    const generation = this.invalidate(comparison);
+    comparison.expandedDeletionsVisible =
+      !comparison.expandedDeletionsVisible;
+    if (!comparison.expandedDeletionsVisible) {
+      this.insets.clearAll();
+    } else {
+      try {
+        await this.renderVisibleEditors(comparison, generation);
+      } catch (error) {
+        if (this.isComparisonCurrent(comparison, generation)) {
+          this.clearComparison();
+          this.showError("Unable to enable expanded deleted rows", error);
+        }
+        return;
+      }
     }
     if (this.isComparisonCurrent(comparison, generation)) {
       this.updateStatusBar();
@@ -235,100 +253,375 @@ export class ComparisonController implements vscode.Disposable {
   }
 
   public async refreshComparison(): Promise<void> {
-    const comparison = this.comparison;
-    if (comparison === undefined) {
-      void vscode.window.showInformationMessage(
-        "Branch Diff: Start a comparison first."
-      );
+    const previous = this.requireComparison();
+    if (previous === undefined) {
       return;
     }
-
-    const generation = this.invalidateAsyncOperations(comparison);
+    const previousGeneration = previous.generation;
+    let replacement: ActiveComparison | undefined;
     try {
-      const branchExists = await localBranchExists(
-        comparison.repoRoot,
-        comparison.baseBranch
-      );
-      if (!this.isComparisonCurrent(comparison, generation)) {
-        return;
-      }
-      if (!branchExists) {
+      if (
+        !(await localBranchExists(
+          previous.repoRoot,
+          previous.baseBranch
+        ))
+      ) {
         throw new Error(
-          `The base branch '${comparison.baseBranch}' no longer exists locally.`
+          `The base branch '${previous.baseBranch}' no longer exists locally.`
         );
       }
-
-      const currentBranch = await getCurrentBranch(comparison.repoRoot);
-      if (!this.isComparisonCurrent(comparison, generation)) {
-        return;
-      }
+      const currentBranch = await getCurrentBranch(previous.repoRoot);
       const mergeBase = await getMergeBase(
-        comparison.repoRoot,
-        comparison.baseBranch
+        previous.repoRoot,
+        previous.baseBranch
       );
-      if (!this.isComparisonCurrent(comparison, generation)) {
-        return;
-      }
       const changedFiles = await getChangedFiles(
-        comparison.repoRoot,
+        previous.repoRoot,
         mergeBase
       );
-      if (!this.isComparisonCurrent(comparison, generation)) {
+      if (!this.isComparisonCurrent(previous, previousGeneration)) {
         return;
       }
-
-      comparison.currentBranch = currentBranch;
-      comparison.mergeBase = mergeBase;
-      comparison.changedFiles = changedFiles;
-      comparison.parsedRanges.clear();
-      this.clearDecorations();
-      await this.applyToVisibleEditors(comparison, generation);
-      if (!this.isComparisonCurrent(comparison, generation)) {
-        return;
-      }
-      this.updateStatusBar();
-
-      if (comparison.changedFiles.length === 0) {
-        void vscode.window.showInformationMessage(
-          `Branch Diff: No changes relative to ${comparison.baseBranch}.`
-        );
+      const generation = ++this.generation;
+      replacement = createComparisonReplacement(previous, generation, {
+        currentBranch,
+        mergeBase,
+        changedFiles
+      });
+      this.cancelAllTimers();
+      this.comparison = replacement;
+      await this.renderVisibleEditors(replacement, generation);
+      if (this.isComparisonCurrent(replacement, generation)) {
+        this.updateStatusBar();
       }
     } catch (error) {
-      if (this.isComparisonCurrent(comparison, generation)) {
-        this.showError("Unable to refresh comparison", error);
+      if (replacement === undefined) {
+        if (this.isComparisonCurrent(previous, previousGeneration)) {
+          this.showError("Unable to refresh comparison", error);
+        }
+        return;
+      }
+      if (this.comparison === replacement) {
+        const restored = await this.restoreComparison(previous);
+        this.showError(
+          restored
+            ? "Unable to refresh comparison"
+            : "Unable to refresh comparison; the previous presentation was cleared",
+          error
+        );
       }
     }
   }
 
   public clearComparison(): void {
-    this.invalidateAsyncOperations();
+    this.generation += 1;
     this.comparison = undefined;
+    this.cancelAllTimers();
     this.clearDecorations();
+    this.insets.clearAll();
     this.statusBar.hide();
+  }
+
+  private beginReplacement(): number {
+    this.clearComparison();
+    return this.generation;
+  }
+
+  private requireComparison(): ActiveComparison | undefined {
+    if (this.comparison === undefined) {
+      void vscode.window.showInformationMessage(
+        "Branch Diff: Start a comparison first."
+      );
+    }
+    return this.comparison;
+  }
+
+  private async renderVisibleEditors(
+    comparison: ActiveComparison,
+    generation: number
+  ): Promise<void> {
+    await Promise.all(
+      vscode.window.visibleTextEditors.map((editor) =>
+        this.renderEditor(editor, comparison, generation)
+      )
+    );
+  }
+
+  private async renderEditor(
+    editor: vscode.TextEditor,
+    expectedComparison?: ActiveComparison,
+    expectedGeneration?: number
+  ): Promise<void> {
+    const comparison = expectedComparison ?? this.comparison;
+    const generation = expectedGeneration ?? comparison?.generation;
+    if (
+      comparison === undefined ||
+      generation === undefined ||
+      !this.isComparisonCurrent(comparison, generation) ||
+      editor.document.uri.scheme !== "file"
+    ) {
+      this.clearEditor(editor);
+      return;
+    }
+    const relativePath = this.relativeRepositoryPath(
+      comparison,
+      editor.document.uri.fsPath
+    );
+    const file = comparison.changedFiles.find(
+      (candidate) =>
+        candidate.path === relativePath && candidate.status !== "D"
+    );
+    if (relativePath === undefined || file === undefined) {
+      this.clearEditor(editor);
+      return;
+    }
+
+    const version = editor.document.version;
+    const baseContent = await this.getBaseContent(comparison, generation, file);
+    if (
+      baseContent === undefined ||
+      !this.isRenderCurrent(editor, comparison, generation, file, version)
+    ) {
+      return;
+    }
+    const parsed = buildDiffModel(
+      file.oldPath ?? file.path,
+      file.path,
+      baseContent,
+      editor.document.getText()
+    );
+    if (!this.isRenderCurrent(editor, comparison, generation, file, version)) {
+      return;
+    }
+    if (parsed.binary) {
+      this.clearEditor(editor);
+      return;
+    }
+    if (comparison.expandedDeletionsVisible) {
+      this.insets.render(
+        editor,
+        parsed.deletedBlocks,
+        this.insetStyle(editor),
+        () =>
+          this.isRenderCurrent(
+            editor,
+            comparison,
+            generation,
+            file,
+            version
+          ) && comparison.expandedDeletionsVisible
+      );
+    } else {
+      this.insets.clearEditor(editor);
+    }
+    this.applyDecorations(editor, parsed, comparison.highlightsVisible);
+  }
+
+  private async getBaseContent(
+    comparison: ActiveComparison,
+    generation: number,
+    file: ChangedFile
+  ): Promise<string | undefined> {
+    const cached = comparison.baseContents.get(file.path);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const content = await getBaseFileContent(
+      comparison.repoRoot,
+      comparison.mergeBase,
+      file
+    );
+    if (!this.isFileCurrent(comparison, generation, file)) {
+      return undefined;
+    }
+    comparison.baseContents.set(file.path, content);
+    return content;
+  }
+
+  private scheduleDocumentRender(document: vscode.TextDocument): void {
+    const comparison = this.comparison;
+    if (
+      comparison === undefined ||
+      document.uri.scheme !== "file" ||
+      this.relativeRepositoryPath(comparison, document.uri.fsPath) === undefined
+    ) {
+      return;
+    }
+    this.insets.clearDocument(document);
+    const key = document.uri.toString();
+    const previous = this.editTimers.get(key);
+    if (previous !== undefined) {
+      clearTimeout(previous);
+    }
+    const generation = comparison.generation;
+    this.editTimers.set(
+      key,
+      setTimeout(() => {
+        this.editTimers.delete(key);
+        if (!this.isComparisonCurrent(comparison, generation)) {
+          return;
+        }
+        for (const editor of vscode.window.visibleTextEditors) {
+          if (editor.document === document) {
+            this.renderEditorInBackground(editor, comparison, generation);
+          }
+        }
+      }, EDIT_DEBOUNCE_MS)
+    );
+  }
+
+  private cancelDocumentTimer(document: vscode.TextDocument): void {
+    const key = document.uri.toString();
+    const timer = this.editTimers.get(key);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.editTimers.delete(key);
+    }
+  }
+
+  private cancelAllTimers(): void {
+    for (const timer of this.editTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.editTimers.clear();
+  }
+
+  private applyDecorations(
+    editor: vscode.TextEditor,
+    parsed: ParsedFileDiff,
+    visible: boolean
+  ): void {
+    if (!visible) {
+      this.clearEditorDecorations(editor);
+      return;
+    }
+    const fullDocumentRange = [
+      new vscode.Range(
+        0,
+        0,
+        Math.max(0, editor.document.lineCount - 1),
+        Number.MAX_SAFE_INTEGER
+      )
+    ];
+    editor.setDecorations(
+      this.addedDecoration,
+      parsed.wholeFileAdded
+        ? fullDocumentRange
+        : this.toEditorRanges(parsed.added, editor.document)
+    );
+    editor.setDecorations(
+      this.modifiedDecoration,
+      this.toEditorRanges(parsed.modified, editor.document)
+    );
+  }
+
+  private insetStyle(editor: vscode.TextEditor): {
+    fontSize: number;
+    tabSize: number;
+  } {
+    const configuration = vscode.workspace.getConfiguration(
+      "editor",
+      editor.document.uri
+    );
+    const configuredTabSize = editor.options.tabSize;
+    return {
+      fontSize: configuration.get<number>("fontSize", 14),
+      tabSize:
+        typeof configuredTabSize === "number" ? configuredTabSize : 4
+    };
+  }
+
+  private toEditorRanges(
+    ranges: readonly LineRange[],
+    document: vscode.TextDocument
+  ): vscode.Range[] {
+    const lastLine = Math.max(0, document.lineCount - 1);
+    return ranges
+      .filter((range) => range.end > 0 && range.start <= lastLine)
+      .map((range) => {
+        const start = Math.min(Math.max(0, range.start), lastLine);
+        const end = Math.min(Math.max(start, range.end - 1), lastLine);
+        return new vscode.Range(start, 0, end, Number.MAX_SAFE_INTEGER);
+      });
+  }
+
+  private async openChangedFile(file: ChangedFile): Promise<void> {
+    const comparison = this.comparison;
+    if (comparison === undefined) {
+      return;
+    }
+    const generation = comparison.generation;
+    try {
+      const document = await vscode.workspace.openTextDocument(
+        vscode.Uri.file(resolveRepositoryPath(comparison.repoRoot, file.path))
+      );
+      if (!this.isFileCurrent(comparison, generation, file)) {
+        return;
+      }
+      const editor = await vscode.window.showTextDocument(document, {
+        viewColumn:
+          vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.Active,
+        preserveFocus: false,
+        preview: false
+      });
+      await this.renderEditor(editor, comparison, generation);
+      if (!this.isFileCurrent(comparison, generation, file)) {
+        return;
+      }
+      const base = await this.getBaseContent(comparison, generation, file);
+      if (base === undefined) {
+        return;
+      }
+      const parsed = buildDiffModel(
+        file.oldPath ?? file.path,
+        file.path,
+        base,
+        document.getText()
+      );
+      const firstLine = this.firstChangedLine(parsed);
+      if (firstLine !== undefined) {
+        const line = Math.min(firstLine, Math.max(0, document.lineCount - 1));
+        const position = new vscode.Position(line, 0);
+        editor.revealRange(
+          new vscode.Range(position, position),
+          vscode.TextEditorRevealType.InCenterIfOutsideViewport
+        );
+        editor.selection = new vscode.Selection(position, position);
+      }
+    } catch (error) {
+      if (this.isFileCurrent(comparison, generation, file)) {
+        this.clearComparison();
+        this.showError(`Unable to open ${file.path}`, error);
+      }
+    }
+  }
+
+  private firstChangedLine(parsed: ParsedFileDiff): number | undefined {
+    const candidates = [
+      ...parsed.added.map((range) => range.start),
+      ...parsed.modified.map((range) => range.start),
+      ...parsed.deletedBlocks.map((block) => block.afterLine + 1)
+    ];
+    return candidates.length === 0 ? undefined : Math.min(...candidates);
   }
 
   private async chooseRepository(): Promise<string | undefined> {
     const activeUri = vscode.window.activeTextEditor?.document.uri;
     if (activeUri?.scheme === "file") {
-      const activeRoot = await findRepositoryRoot(
-        path.dirname(activeUri.fsPath)
-      );
+      const activeRoot = await findRepositoryRoot(path.dirname(activeUri.fsPath));
       if (activeRoot !== undefined) {
         return activeRoot;
       }
     }
-
     const roots = new Set<string>();
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
-      if (folder.uri.scheme !== "file") {
-        continue;
-      }
-      const root = await findRepositoryRoot(folder.uri.fsPath);
-      if (root !== undefined) {
-        roots.add(root);
+      if (folder.uri.scheme === "file") {
+        const root = await findRepositoryRoot(folder.uri.fsPath);
+        if (root !== undefined) {
+          roots.add(root);
+        }
       }
     }
-
     if (roots.size === 0) {
       void vscode.window.showErrorMessage(
         "Branch Diff: No Git repository was found for the active editor or workspace."
@@ -338,18 +631,16 @@ export class ComparisonController implements vscode.Disposable {
     if (roots.size === 1) {
       return [...roots][0];
     }
-
-    const items = [...roots]
-      .sort((left, right) => left.localeCompare(right))
-      .map((repoRoot) => ({
-        label: path.basename(repoRoot),
-        description: repoRoot,
-        repoRoot
-      }));
-    const selected = await vscode.window.showQuickPick(items, {
-      placeHolder: "Choose a Git repository",
-      matchOnDescription: true
-    });
+    const selected = await vscode.window.showQuickPick(
+      [...roots]
+        .sort((left, right) => left.localeCompare(right))
+        .map((repoRoot) => ({
+          label: path.basename(repoRoot),
+          description: repoRoot,
+          repoRoot
+        })),
+      { placeHolder: "Choose a Git repository", matchOnDescription: true }
+    );
     return selected?.repoRoot;
   }
 
@@ -362,32 +653,28 @@ export class ComparisonController implements vscode.Disposable {
       quickPick.title = "Branch Diff: Choose Base Branch";
       quickPick.placeholder =
         "Compare the working branch and working tree against a local branch";
-      quickPick.matchOnDescription = true;
       quickPick.items = branches.map((branch) => ({
         label: `$(git-branch) ${branch}`,
         branch
       }));
-
       const preferredItem = quickPick.items.find(
         (item) => item.branch === preferred
       );
       if (preferredItem !== undefined) {
         quickPick.activeItems = [preferredItem];
       }
-
       let completed = false;
-      const acceptDisposable = quickPick.onDidAccept(() => {
+      const accept = quickPick.onDidAccept(() => {
         const item = quickPick.selectedItems[0] ?? quickPick.activeItems[0];
-        if (item === undefined) {
-          return;
+        if (item !== undefined) {
+          completed = true;
+          quickPick.hide();
+          resolve(item.branch);
         }
-        completed = true;
-        quickPick.hide();
-        resolve(item.branch);
       });
-      const hideDisposable = quickPick.onDidHide(() => {
-        acceptDisposable.dispose();
-        hideDisposable.dispose();
+      const hide = quickPick.onDidHide(() => {
+        accept.dispose();
+        hide.dispose();
         quickPick.dispose();
         if (!completed) {
           resolve(undefined);
@@ -406,24 +693,20 @@ export class ComparisonController implements vscode.Disposable {
       quickPick.placeholder = "Search changed files";
       quickPick.matchOnDescription = true;
       quickPick.matchOnDetail = true;
-      quickPick.items = files.map((file) => {
-        const renamedPath =
+      quickPick.items = files.map((file) => ({
+        label:
           file.oldPath === undefined
             ? file.path
-            : `${file.oldPath} -> ${file.path}`;
-        return {
-          label: renamedPath,
-          description:
-            file.status === "D"
-              ? "Deleted (not selectable)"
-              : `${file.status} ${STATUS_DESCRIPTIONS[file.status] ?? "Changed"}`,
-          detail: file.path,
-          file
-        };
-      });
-
+            : `${file.oldPath} -> ${file.path}`,
+        description:
+          file.status === "D"
+            ? "Deleted (not selectable)"
+            : `${file.status} ${STATUS_DESCRIPTIONS[file.status] ?? "Changed"}`,
+        detail: file.path,
+        file
+      }));
       let completed = false;
-      const acceptDisposable = quickPick.onDidAccept(() => {
+      const accept = quickPick.onDidAccept(() => {
         const item = quickPick.selectedItems[0] ?? quickPick.activeItems[0];
         if (item === undefined) {
           return;
@@ -438,9 +721,9 @@ export class ComparisonController implements vscode.Disposable {
         quickPick.hide();
         resolve(item.file);
       });
-      const hideDisposable = quickPick.onDidHide(() => {
-        acceptDisposable.dispose();
-        hideDisposable.dispose();
+      const hide = quickPick.onDidHide(() => {
+        accept.dispose();
+        hide.dispose();
         quickPick.dispose();
         if (!completed) {
           resolve(undefined);
@@ -450,273 +733,79 @@ export class ComparisonController implements vscode.Disposable {
     });
   }
 
-  private async openChangedFile(file: ChangedFile): Promise<void> {
-    const comparison = this.comparison;
-    if (comparison === undefined) {
-      return;
-    }
-    const generation = comparison.generation;
-
-    try {
-      const uri = vscode.Uri.file(
-        resolveRepositoryPath(comparison.repoRoot, file.path)
-      );
-      const document = await vscode.workspace.openTextDocument(uri);
-      if (!this.isFileCurrent(comparison, generation, file)) {
-        return;
-      }
-      const editor = await vscode.window.showTextDocument(document, {
-        viewColumn:
-          vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.Active,
-        preserveFocus: false,
-        preview: false
-      });
-      if (!this.isEditorTargetCurrent(editor, comparison, generation, file)) {
-        return;
-      }
-      const parsed = await this.getParsedDiff(
-        editor,
-        comparison,
-        generation,
-        file
-      );
-      if (parsed === undefined) {
-        return;
-      }
-      if (parsed.binary) {
-        this.clearEditorDecorations(editor);
-        void vscode.window.showInformationMessage(
-          `Branch Diff: ${file.path} is binary; line highlights are unavailable.`
-        );
-        return;
-      }
-
-      await this.applyDecorations(editor, comparison, generation);
-      if (!this.isEditorTargetCurrent(editor, comparison, generation, file)) {
-        return;
-      }
-      const firstLine = this.firstChangedLine(parsed);
-      if (firstLine !== undefined) {
-        const line = Math.min(firstLine, Math.max(0, document.lineCount - 1));
-        const range = new vscode.Range(line, 0, line, 0);
-        editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-        editor.selection = new vscode.Selection(range.start, range.start);
-      }
-    } catch (error) {
-      if (this.isFileCurrent(comparison, generation, file)) {
-        this.showError(`Unable to open ${file.path}`, error);
-      }
-    }
-  }
-
-  private async applyToVisibleEditors(
-    comparison: ActiveComparison,
-    generation: number
-  ): Promise<void> {
-    await Promise.all(
-      vscode.window.visibleTextEditors.map((editor) =>
-        this.applyDecorations(editor, comparison, generation)
-      )
-    );
-  }
-
-  private async applyDecorations(
-    editor: vscode.TextEditor,
-    expectedComparison?: ActiveComparison,
-    expectedGeneration?: number
-  ): Promise<void> {
-    const comparison = expectedComparison ?? this.comparison;
-    const generation = expectedGeneration ?? comparison?.generation;
-    if (
-      expectedComparison !== undefined &&
-      expectedGeneration !== undefined &&
-      !this.isComparisonCurrent(expectedComparison, expectedGeneration)
-    ) {
-      return;
-    }
-    if (
-      comparison === undefined ||
-      generation === undefined ||
-      !comparison.highlightsVisible ||
-      editor.document.uri.scheme !== "file"
-    ) {
-      this.clearEditorDecorations(editor);
-      return;
-    }
-
-    const relativePath = this.relativeRepositoryPath(
-      comparison,
-      editor.document.uri.fsPath
-    );
-    if (relativePath === undefined) {
-      this.clearEditorDecorations(editor);
-      return;
-    }
-
-    const file = comparison.changedFiles.find(
-      (candidate) => candidate.path === relativePath && candidate.status !== "D"
-    );
-    if (file === undefined) {
-      this.clearEditorDecorations(editor);
-      return;
-    }
-
-    try {
-      const parsed = await this.getParsedDiff(
-        editor,
-        comparison,
-        generation,
-        file
-      );
-      if (parsed === undefined) {
-        return;
-      }
-      if (!this.isDecorationCurrent(editor, comparison, generation, file)) {
-        return;
-      }
-      if (parsed.binary) {
-        this.clearEditorDecorations(editor);
-        return;
-      }
-
-      const fullDocumentRange = [
-        new vscode.Range(
-          0,
-          0,
-          Math.max(0, editor.document.lineCount - 1),
-          Number.MAX_SAFE_INTEGER
-        )
-      ];
-      editor.setDecorations(
-        this.addedDecoration,
-        parsed.wholeFileAdded
-          ? fullDocumentRange
-          : this.toEditorRanges(parsed.added, editor.document)
-      );
-      editor.setDecorations(
-        this.modifiedDecoration,
-        this.toEditorRanges(parsed.modified, editor.document)
-      );
-      editor.setDecorations(
-        this.deletedDecoration,
-        parsed.deletedMarkers.map((line) => {
-          const safeLine = Math.min(
-            Math.max(0, line),
-            Math.max(0, editor.document.lineCount - 1)
-          );
-          return new vscode.Range(safeLine, 0, safeLine, 0);
-        })
-      );
-    } catch (error) {
-      if (this.isDecorationCurrent(editor, comparison, generation, file)) {
-        this.clearEditorDecorations(editor);
-        this.showError(`Unable to decorate ${relativePath}`, error);
-      }
-    }
-  }
-
-  private toEditorRanges(
-    ranges: readonly LineRange[],
-    document: vscode.TextDocument
-  ): vscode.Range[] {
-    const lastLine = Math.max(0, document.lineCount - 1);
-    return ranges
-      .filter((range) => range.end > 0 && range.start <= lastLine)
-      .map((range) => {
-        const start = Math.min(Math.max(0, range.start), lastLine);
-        const end = Math.min(Math.max(start, range.end - 1), lastLine);
-        return new vscode.Range(start, 0, end, Number.MAX_SAFE_INTEGER);
-      });
-  }
-
-  private async getParsedDiff(
-    editor: vscode.TextEditor,
-    comparison: ActiveComparison,
-    generation: number,
-    file: ChangedFile
-  ): Promise<ParsedFileDiff | undefined> {
-    const cached = comparison.parsedRanges.get(file.path);
-    if (cached !== undefined) {
-      return cached;
-    }
-    const parsed = await getFileDiff(
-      comparison.repoRoot,
-      comparison.mergeBase,
-      file
-    );
-    if (!this.isEditorTargetCurrent(editor, comparison, generation, file)) {
-      return undefined;
-    }
-    comparison.parsedRanges.set(file.path, parsed);
-    return parsed;
-  }
-
-  private async refreshSavedFile(document: vscode.TextDocument): Promise<void> {
-    const comparison = this.comparison;
-    if (comparison === undefined || document.uri.scheme !== "file") {
-      return;
-    }
-
-    const relativePath = this.relativeRepositoryPath(
-      comparison,
-      document.uri.fsPath
-    );
-    if (relativePath === undefined) {
-      return;
-    }
-
-    const existingFile = comparison.changedFiles.find(
-      (file) => file.path === relativePath
-    );
-    if (existingFile === undefined) {
-      return;
-    }
-
-    const generation = this.invalidateAsyncOperations(comparison);
-    try {
-      comparison.parsedRanges.delete(relativePath);
-      const editors = vscode.window.visibleTextEditors.filter(
-        (candidate) => candidate.document.uri.toString() === document.uri.toString()
-      );
-      await Promise.all(
-        editors.map((editor) =>
-          this.applyDecorations(editor, comparison, generation)
-        )
-      );
-    } catch (error) {
-      if (this.isComparisonCurrent(comparison, generation)) {
-        this.showError(`Unable to refresh ${relativePath}`, error);
-      }
-    }
-  }
-
   private relativeRepositoryPath(
     comparison: ActiveComparison,
     filePath: string
   ): string | undefined {
-    const relativePath = path.relative(
-      comparison.repoRoot,
-      path.resolve(filePath)
-    );
+    const relative = path.relative(comparison.repoRoot, path.resolve(filePath));
     if (
-      relativePath === "" ||
-      relativePath === ".." ||
-      relativePath.startsWith(`..${path.sep}`) ||
-      path.isAbsolute(relativePath)
+      relative === "" ||
+      relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative)
     ) {
       return undefined;
     }
-    return relativePath.split(path.sep).join("/");
+    return relative.split(path.sep).join("/");
   }
 
-  private invalidateAsyncOperations(
-    comparison?: ActiveComparison
-  ): number {
+  private invalidate(comparison: ActiveComparison): number {
     const generation = ++this.generation;
-    if (comparison !== undefined) {
-      comparison.generation = generation;
-    }
+    comparison.generation = generation;
+    this.cancelAllTimers();
     return generation;
+  }
+
+  private async restoreComparison(
+    previous: ActiveComparison
+  ): Promise<boolean> {
+    this.clearDecorations();
+    this.insets.clearAll();
+    const generation = ++this.generation;
+    previous.generation = generation;
+    this.comparison = previous;
+    try {
+      await this.renderVisibleEditors(previous, generation);
+      if (!this.isComparisonCurrent(previous, generation)) {
+        return false;
+      }
+      this.updateStatusBar();
+      return true;
+    } catch {
+      if (this.comparison === previous) {
+        this.clearComparison();
+      }
+      return false;
+    }
+  }
+
+  private renderEditorInBackground(
+    editor: vscode.TextEditor,
+    comparison = this.comparison,
+    generation = comparison?.generation
+  ): void {
+    void this.renderEditor(editor, comparison, generation).catch(
+      (error: unknown) => {
+        if (
+          comparison === undefined ||
+          generation === undefined ||
+          !this.isComparisonCurrent(comparison, generation)
+        ) {
+          return;
+        }
+        this.clearComparison();
+        if (this.proposedApiErrorGeneration === generation) {
+          return;
+        }
+        this.proposedApiErrorGeneration = generation;
+        this.showError(
+          error instanceof Error && error.message === PROPOSED_API_INSTRUCTIONS
+            ? "Unable to render expanded deleted rows"
+            : "Unable to update comparison presentation",
+          error
+        );
+      }
+    );
   }
 
   private isGenerationCurrent(generation: number): boolean {
@@ -745,45 +834,20 @@ export class ComparisonController implements vscode.Disposable {
     );
   }
 
-  private isEditorTargetCurrent(
+  private isRenderCurrent(
     editor: vscode.TextEditor,
     comparison: ActiveComparison,
     generation: number,
-    file: ChangedFile
+    file: ChangedFile,
+    version: number
   ): boolean {
     return (
       this.isFileCurrent(comparison, generation, file) &&
+      editor.document.version === version &&
       vscode.window.visibleTextEditors.includes(editor) &&
-      editor.document.uri.scheme === "file" &&
-      this.relativeRepositoryPath(
-        comparison,
-        editor.document.uri.fsPath
-      ) === file.path
+      this.relativeRepositoryPath(comparison, editor.document.uri.fsPath) ===
+        file.path
     );
-  }
-
-  private isDecorationCurrent(
-    editor: vscode.TextEditor,
-    comparison: ActiveComparison,
-    generation: number,
-    file: ChangedFile
-  ): boolean {
-    return (
-      comparison.highlightsVisible &&
-      this.isEditorTargetCurrent(editor, comparison, generation, file)
-    );
-  }
-
-  private firstChangedLine(parsed: ParsedFileDiff): number | undefined {
-    if (parsed.wholeFileAdded) {
-      return 0;
-    }
-    const candidates = [
-      ...parsed.added.map((range) => range.start),
-      ...parsed.modified.map((range) => range.start),
-      ...parsed.deletedMarkers
-    ];
-    return candidates.length === 0 ? undefined : Math.min(...candidates);
   }
 
   private clearDecorations(): void {
@@ -792,10 +856,14 @@ export class ComparisonController implements vscode.Disposable {
     }
   }
 
+  private clearEditor(editor: vscode.TextEditor): void {
+    this.clearEditorDecorations(editor);
+    this.insets.clearEditor(editor);
+  }
+
   private clearEditorDecorations(editor: vscode.TextEditor): void {
     editor.setDecorations(this.addedDecoration, []);
     editor.setDecorations(this.modifiedDecoration, []);
-    editor.setDecorations(this.deletedDecoration, []);
   }
 
   private updateStatusBar(): void {
@@ -804,9 +872,14 @@ export class ComparisonController implements vscode.Disposable {
       this.statusBar.hide();
       return;
     }
-
-    const hiddenSuffix = comparison.highlightsVisible ? "" : " (hidden)";
-    this.statusBar.text = `$(git-compare) working vs ${comparison.baseBranch}${hiddenSuffix}`;
+    const states = [
+      comparison.highlightsVisible ? "highlights on" : "highlights off",
+      comparison.expandedDeletionsVisible
+        ? "deleted rows on"
+        : "deleted rows off"
+    ];
+    this.statusBar.text = `$(git-compare) working vs ${comparison.baseBranch}`;
+    this.statusBar.tooltip = `Branch Diff: ${states.join(", ")}. Browse changed files.`;
     this.statusBar.show();
   }
 

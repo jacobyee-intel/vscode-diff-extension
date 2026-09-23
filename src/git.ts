@@ -73,9 +73,13 @@ function parseStatus(statusField: string): {
   score?: number;
 } {
   if (statusField.startsWith("R") || statusField.startsWith("C")) {
+    const scoreText = statusField.slice(1);
+    if (!/^\d{1,3}$/u.test(scoreText)) {
+      throw new Error(`Malformed Git rename/copy status: ${statusField}`);
+    }
     return {
       status: statusField[0] as GitFileStatus,
-      score: Number(statusField.slice(1))
+      score: Number(scoreText)
     };
   }
 
@@ -90,7 +94,7 @@ function parseStatus(statusField: string): {
     return { status };
   }
 
-  return { status: "M" };
+  throw new Error(`Unsupported Git file status: ${statusField}`);
 }
 
 export function parseNameStatus(output: string): ChangedFile[] {
@@ -104,14 +108,14 @@ export function parseNameStatus(output: string): ChangedFile[] {
     const statusField = fields[index];
     const firstPath = fields[index + 1];
     if (statusField === undefined || firstPath === undefined) {
-      break;
+      throw new Error("Truncated NUL-delimited Git status output.");
     }
 
     const parsedStatus = parseStatus(statusField);
     if (parsedStatus.status === "R" || parsedStatus.status === "C") {
       const newPath = fields[index + 2];
       if (newPath === undefined) {
-        break;
+        throw new Error("Truncated Git rename/copy status output.");
       }
       files.push({
         status: parsedStatus.status,
@@ -295,11 +299,20 @@ export async function getChangedFiles(
 ): Promise<ChangedFile[]> {
   const [trackedOutput, untrackedOutput] = await Promise.all([
     runGit(repoRoot, [
+      "-c",
+      "color.ui=false",
+      "-c",
+      "diff.external=",
+      "-c",
+      "core.quotePath=false",
       "diff",
       "--name-status",
       "-z",
       "--find-renames",
       "--no-color",
+      "--no-ext-diff",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
       mergeBase
     ]),
     runGit(repoRoot, ["ls-files", "--others", "--exclude-standard", "-z"])
@@ -335,14 +348,40 @@ export async function getFileDiff(
 
   const paths = file.oldPath === undefined ? [file.path] : [file.oldPath, file.path];
   const output = await runGit(repoRoot, [
+    "-c",
+    "color.ui=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "core.quotePath=false",
     "diff",
     "--unified=0",
     "--no-color",
     "--no-ext-diff",
     "--find-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
     mergeBase,
     "--",
     ...paths
   ]);
-  return parseUnifiedDiff(output);
+  if (output.length === 0) {
+    throw new Error(`Git returned no diff section for ${file.path}.`);
+  }
+  return parseUnifiedDiff(output, {
+    oldPath: file.oldPath ?? file.path,
+    newPath: file.path
+  });
+}
+
+export async function getBaseFileContent(
+  repoRoot: string,
+  mergeBase: string,
+  file: ChangedFile
+): Promise<string> {
+  if (file.untracked || file.status === "A") {
+    return "";
+  }
+  const repositoryPath = file.oldPath ?? file.path;
+  return runGit(repoRoot, ["show", `${mergeBase}:${repositoryPath}`]);
 }

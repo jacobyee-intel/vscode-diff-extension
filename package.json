@@ -2,7 +2,7 @@
   "name": "branch-diff",
   "displayName": "Branch Diff",
   "description": "Compare the working branch and working tree against a local base branch in normal editable editors.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -12,6 +12,9 @@
   "engines": {
     "vscode": "^1.74.0"
   },
+  "enabledApiProposals": [
+    "editorInsets"
+  ],
   "categories": [
     "Other"
   ],
@@ -19,6 +22,7 @@
     "onCommand:branchDiff.startComparison",
     "onCommand:branchDiff.browseChangedFiles",
     "onCommand:branchDiff.toggleHighlights",
+    "onCommand:branchDiff.toggleExpandedDeletions",
     "onCommand:branchDiff.refreshComparison",
     "onCommand:branchDiff.clearComparison"
   ],
@@ -38,6 +42,10 @@
         "title": "Branch Diff: Toggle Highlights"
       },
       {
+        "command": "branchDiff.toggleExpandedDeletions",
+        "title": "Branch Diff: Toggle Expanded Deleted Rows"
+      },
+      {
         "command": "branchDiff.refreshComparison",
         "title": "Branch Diff: Refresh Comparison"
       },
@@ -48,12 +56,16 @@
     ],
     "keybindings": [
       {
+        "command": "branchDiff.toggleExpandedDeletions",
+        "key": "ctrl+e ctrl+t"
+      },
+      {
         "command": "branchDiff.browseChangedFiles",
-        "key": "ctrl+e t"
+        "key": "ctrl+e ctrl+g"
       },
       {
         "command": "branchDiff.toggleHighlights",
-        "key": "ctrl+e r"
+        "key": "ctrl+e ctrl+r"
       }
     ],
     "colors": [
@@ -79,7 +91,7 @@
       },
       {
         "id": "branchDiff.deletedLineForeground",
-        "description": "Marker color for deleted-only hunks relative to the selected base branch.",
+        "description": "Foreground color for expanded deleted rows relative to the selected base branch.",
         "defaults": {
           "dark": "#F85149",
           "light": "#CF222E",
@@ -93,15 +105,25 @@
     "clean": "node -e \"require('fs').rmSync('out', { recursive: true, force: true })\"",
     "compile": "tsc -p tsconfig.json",
     "lint": "eslint .",
-    "test": "npm run compile && node --test out/test/*.test.js",
+    "test": "npm run test:unit",
+    "test:unit": "npm run compile && node --test out/test/*.test.js",
+    "test:integration": "npm run compile && node out/test/runIntegrationTests.js",
+    "package:vsix": "vsce package",
+    "verify:vsix": "npm run compile && node out/scripts/assertVsixContents.js",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/diff": "5.2.3",
     "@types/node": "^22.10.0",
     "@types/vscode": "1.74.0",
+    "@vscode/test-electron": "2.4.1",
+    "@vscode/vsce": "4.0.0",
     "eslint": "^10.11.0",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.70.0"
+  },
+  "dependencies": {
+    "diff": "5.2.2"
   }
 }

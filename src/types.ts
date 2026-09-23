@@ -13,10 +13,16 @@ export interface LineRange {
   end: number;
 }
 
+export interface DeletedBlock {
+  afterLine: number;
+  originalStartLine: number;
+  lines: string[];
+}
+
 export interface ParsedFileDiff {
   added: LineRange[];
   modified: LineRange[];
-  deletedMarkers: number[];
+  deletedBlocks: DeletedBlock[];
   binary: boolean;
   wholeFileAdded: boolean;
 }
@@ -28,6 +34,7 @@ export interface ActiveComparison {
   baseBranch: string;
   mergeBase: string;
   changedFiles: ChangedFile[];
-  parsedRanges: Map<string, ParsedFileDiff>;
+  baseContents: Map<string, string>;
   highlightsVisible: boolean;
+  expandedDeletionsVisible: boolean;
 }
