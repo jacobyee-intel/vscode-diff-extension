@@ -2,7 +2,7 @@
   "name": "branch-diff",
   "displayName": "Branch Diff",
   "description": "Compare the working branch and working tree against a local base branch in normal editable editors.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -10,7 +10,7 @@
     "url": "https://github.com/jacobyee-intel/vscode-diff-extension.git"
   },
   "engines": {
-    "vscode": "^1.138.0"
+    "vscode": "^1.74.0"
   },
   "categories": [
     "Other"
@@ -99,7 +99,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.0",
-    "@types/vscode": "^1.138.0",
+    "@types/vscode": "1.74.0",
     "eslint": "^10.11.0",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.70.0"

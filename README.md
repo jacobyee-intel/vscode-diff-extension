@@ -43,7 +43,7 @@ Working-tree content is authoritative, so hunk line numbers come from `git diff 
 
 ## Development
 
-Requirements: Node.js 20 or newer, npm, Git, and VS Code 1.138 or newer.
+Requirements: Node.js 20 or newer, npm, Git, and VS Code 1.74 or newer.
 
 ```bash
 npm install
