@@ -7,7 +7,7 @@ copyable rows. It does not open VS Code's native diff editor.
 
 ## Required VS Code Stable launch
 
-Version 0.2.0 uses VS Code's proposed `editorInsets` API. A manually installed
+Version 0.2.1 uses VS Code's proposed `editorInsets` API. A manually installed
 VSIX must be enabled explicitly:
 
 ```bash
@@ -134,12 +134,12 @@ Host smoke tests.
 
 ```bash
 npm run package:vsix
-npm run verify:vsix -- branch-diff-0.2.0.vsix
+npm run verify:vsix -- branch-diff-0.2.1.vsix
 ```
 
 Use the ordinary `vsce package` flow above. Do not add `--no-dependencies`:
 Branch Diff requires the production `diff` package at runtime. The verification
 command asserts the exact packaged CommonJS runtime file set.
 
-Install `branch-diff-0.2.0.vsix` using **Extensions: Install from VSIX...**,
+Install `branch-diff-0.2.1.vsix` using **Extensions: Install from VSIX...**,
 then launch Stable with the required proposed-API flag above.

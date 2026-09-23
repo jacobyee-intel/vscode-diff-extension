@@ -21,6 +21,9 @@ void test("renders script-free escaped HTML with the required CSP", () => {
   assert.match(html, /&amp;\t&#39;/u);
   assert.match(html, /tab-size:8/u);
   assert.match(html, /aria-label="Deleted original lines 1 through 2"/u);
+  assert.match(html, /\.marker\{position:absolute;right:\.75em/u);
+  assert.match(html, /\.text\{display:block;/u);
+  assert.doesNotMatch(html, /flex:0 0 2\.5em/u);
 });
 
 class Handle {
