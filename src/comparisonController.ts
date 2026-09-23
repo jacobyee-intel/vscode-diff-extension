@@ -47,6 +47,9 @@ export class ComparisonController implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly addedDecoration: vscode.TextEditorDecorationType;
   private readonly modifiedDecoration: vscode.TextEditorDecorationType;
+  private readonly addedGutterDecoration: vscode.TextEditorDecorationType;
+  private readonly modifiedGutterDecoration: vscode.TextEditorDecorationType;
+  private readonly deletedIndicatorDecoration: vscode.TextEditorDecorationType;
   private readonly statusBar: vscode.StatusBarItem;
   private readonly insets = new InsetManager();
   private readonly editTimers = new Map<string, NodeJS.Timeout>();
@@ -59,7 +62,7 @@ export class ComparisonController implements vscode.Disposable {
       isWholeLine: true,
       backgroundColor: new vscode.ThemeColor("branchDiff.addedLineBackground"),
       overviewRulerColor: new vscode.ThemeColor(
-        "branchDiff.addedLineBackground"
+        "editorOverviewRuler.addedForeground"
       ),
       overviewRulerLane: vscode.OverviewRulerLane.Left
     });
@@ -69,10 +72,34 @@ export class ComparisonController implements vscode.Disposable {
         "branchDiff.modifiedLineBackground"
       ),
       overviewRulerColor: new vscode.ThemeColor(
-        "branchDiff.modifiedLineBackground"
+        "editorOverviewRuler.modifiedForeground"
       ),
       overviewRulerLane: vscode.OverviewRulerLane.Left
     });
+    this.addedGutterDecoration = vscode.window.createTextEditorDecorationType({
+      gutterIconPath: vscode.Uri.file(
+        this.context.asAbsolutePath("media/diff-added.svg")
+      ),
+      gutterIconSize: "contain"
+    });
+    this.modifiedGutterDecoration =
+      vscode.window.createTextEditorDecorationType({
+        gutterIconPath: vscode.Uri.file(
+          this.context.asAbsolutePath("media/diff-modified.svg")
+        ),
+        gutterIconSize: "contain"
+      });
+    this.deletedIndicatorDecoration =
+      vscode.window.createTextEditorDecorationType({
+        gutterIconPath: vscode.Uri.file(
+          this.context.asAbsolutePath("media/diff-deleted.svg")
+        ),
+        gutterIconSize: "contain",
+        overviewRulerColor: new vscode.ThemeColor(
+          "editorOverviewRuler.deletedForeground"
+        ),
+        overviewRulerLane: vscode.OverviewRulerLane.Left
+      });
     this.statusBar = vscode.window.createStatusBarItem(
       vscode.StatusBarAlignment.Left,
       100
@@ -82,6 +109,9 @@ export class ComparisonController implements vscode.Disposable {
     this.disposables.push(
       this.addedDecoration,
       this.modifiedDecoration,
+      this.addedGutterDecoration,
+      this.modifiedGutterDecoration,
+      this.deletedIndicatorDecoration,
       this.statusBar,
       this.insets,
       vscode.window.onDidChangeVisibleTextEditors((editors) => {
@@ -513,6 +543,26 @@ export class ComparisonController implements vscode.Disposable {
       this.modifiedDecoration,
       this.toEditorRanges(parsed.modified, editor.document)
     );
+    editor.setDecorations(
+      this.addedGutterDecoration,
+      parsed.wholeFileAdded
+        ? this.allEditorLineMarkers(editor.document)
+        : this.toEditorLineMarkers(parsed.added, editor.document)
+    );
+    editor.setDecorations(
+      this.modifiedGutterDecoration,
+      this.toEditorLineMarkers(parsed.modified, editor.document)
+    );
+    editor.setDecorations(
+      this.deletedIndicatorDecoration,
+      parsed.deletedBlocks.map((block) => {
+        const line = Math.min(
+          Math.max(0, block.afterLine),
+          Math.max(0, editor.document.lineCount - 1)
+        );
+        return new vscode.Range(line, 0, line, 0);
+      })
+    );
   }
 
   private insetStyle(editor: vscode.TextEditor): {
@@ -543,6 +593,29 @@ export class ComparisonController implements vscode.Disposable {
         const end = Math.min(Math.max(start, range.end - 1), lastLine);
         return new vscode.Range(start, 0, end, Number.MAX_SAFE_INTEGER);
       });
+  }
+
+  private toEditorLineMarkers(
+    ranges: readonly LineRange[],
+    document: vscode.TextDocument
+  ): vscode.Range[] {
+    const lastLine = Math.max(0, document.lineCount - 1);
+    const markers: vscode.Range[] = [];
+    for (const range of ranges) {
+      const start = Math.min(Math.max(0, range.start), lastLine);
+      const end = Math.min(Math.max(start, range.end - 1), lastLine);
+      for (let line = start; line <= end; line += 1) {
+        markers.push(new vscode.Range(line, 0, line, 0));
+      }
+    }
+    return markers;
+  }
+
+  private allEditorLineMarkers(document: vscode.TextDocument): vscode.Range[] {
+    return this.toEditorLineMarkers(
+      [{ start: 0, end: document.lineCount }],
+      document
+    );
   }
 
   private async openChangedFile(file: ChangedFile): Promise<void> {
@@ -864,6 +937,9 @@ export class ComparisonController implements vscode.Disposable {
   private clearEditorDecorations(editor: vscode.TextEditor): void {
     editor.setDecorations(this.addedDecoration, []);
     editor.setDecorations(this.modifiedDecoration, []);
+    editor.setDecorations(this.addedGutterDecoration, []);
+    editor.setDecorations(this.modifiedGutterDecoration, []);
+    editor.setDecorations(this.deletedIndicatorDecoration, []);
   }
 
   private updateStatusBar(): void {

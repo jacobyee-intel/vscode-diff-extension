@@ -2,7 +2,7 @@
   "name": "branch-diff",
   "displayName": "Branch Diff",
   "description": "Compare the working branch and working tree against a local base branch in normal editable editors.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "local",
   "license": "MIT",
   "repository": {
