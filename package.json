@@ -1,0 +1,107 @@
+{
+  "name": "branch-diff",
+  "displayName": "Branch Diff",
+  "description": "Compare the working branch and working tree against a local base branch in normal editable editors.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jacobyee-intel/vscode-diff-extension.git"
+  },
+  "engines": {
+    "vscode": "^1.138.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:branchDiff.startComparison",
+    "onCommand:branchDiff.browseChangedFiles",
+    "onCommand:branchDiff.toggleHighlights",
+    "onCommand:branchDiff.refreshComparison",
+    "onCommand:branchDiff.clearComparison"
+  ],
+  "main": "./out/src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "branchDiff.startComparison",
+        "title": "Branch Diff: Choose Base Branch and Start"
+      },
+      {
+        "command": "branchDiff.browseChangedFiles",
+        "title": "Branch Diff: Browse Changed Files"
+      },
+      {
+        "command": "branchDiff.toggleHighlights",
+        "title": "Branch Diff: Toggle Highlights"
+      },
+      {
+        "command": "branchDiff.refreshComparison",
+        "title": "Branch Diff: Refresh Comparison"
+      },
+      {
+        "command": "branchDiff.clearComparison",
+        "title": "Branch Diff: Clear Comparison"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "branchDiff.browseChangedFiles",
+        "key": "ctrl+e t"
+      },
+      {
+        "command": "branchDiff.toggleHighlights",
+        "key": "ctrl+e r"
+      }
+    ],
+    "colors": [
+      {
+        "id": "branchDiff.addedLineBackground",
+        "description": "Background color for lines added relative to the selected base branch.",
+        "defaults": {
+          "dark": "#2EA04333",
+          "light": "#2DA44E26",
+          "highContrast": "#2EA04355",
+          "highContrastLight": "#2DA44E40"
+        }
+      },
+      {
+        "id": "branchDiff.modifiedLineBackground",
+        "description": "Background color for lines modified relative to the selected base branch.",
+        "defaults": {
+          "dark": "#388BFD30",
+          "light": "#FFD33D40",
+          "highContrast": "#388BFD55",
+          "highContrastLight": "#BF870055"
+        }
+      },
+      {
+        "id": "branchDiff.deletedLineForeground",
+        "description": "Marker color for deleted-only hunks relative to the selected base branch.",
+        "defaults": {
+          "dark": "#F85149",
+          "light": "#CF222E",
+          "highContrast": "#FF7B72",
+          "highContrastLight": "#A40E26"
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('out', { recursive: true, force: true })\"",
+    "compile": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "test": "npm run compile && node --test out/test/*.test.js",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.138.0",
+    "eslint": "^10.11.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.70.0"
+  }
+}
